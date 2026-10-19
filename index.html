@@ -717,6 +717,137 @@ body *{text-transform:none!important}
 <div id="app"></div>
 <div id="toast" class="toast" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+/* Supabase adapter: gives the app the same db / user / downloads objects it used inside Claude. */
+(function () {
+  const SUPABASE_URL = 'https://ptvhnipvcmczzwgsnmqz.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_liqrVWX75gD7sjtw4sgKGA_D3TcWcbM';
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  const clean = o => JSON.parse(JSON.stringify(o === undefined ? {} : o));
+  const rid = () => (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '').slice(0, 20) : Math.random().toString(36).slice(2) + Date.now().toString(36));
+  const cache = {};      // coll -> Map(id -> data)
+  const loaded = {};     // coll -> Promise
+  const subs = {};       // coll -> Set(fn)
+  const chans = {};      // coll -> realtime channel
+  const timers = {};
+
+  async function fetchAll(coll) {
+    const m = new Map(); let from = 0;
+    for (;;) {
+      const { data, error } = await sb.from('docs').select('id,data').eq('coll', coll).order('id').range(from, from + 999);
+      if (error) throw error;
+      data.forEach(r => m.set(r.id, r.data));
+      if (data.length < 1000) break;
+      from += 1000;
+    }
+    return m;
+  }
+  function notify(coll) { (subs[coll] || new Set()).forEach(f => { try { f(); } catch (e) { console.error(e); } }); }
+  function reload(coll) {
+    clearTimeout(timers[coll]);
+    timers[coll] = setTimeout(async () => {
+      try { cache[coll] = await fetchAll(coll); loaded[coll] = Promise.resolve(); notify(coll); } catch (e) { console.error(e); }
+    }, 150);
+  }
+  function ensure(coll) {
+    if (!loaded[coll]) loaded[coll] = fetchAll(coll).then(m => { cache[coll] = m; });
+    if (!chans[coll]) {
+      chans[coll] = sb.channel('c:' + coll).on('postgres_changes', { event: '*', schema: 'public', table: 'docs', filter: 'coll=eq.' + coll }, () => reload(coll)).subscribe();
+    }
+    return loaded[coll];
+  }
+  setInterval(() => Object.keys(subs).forEach(c => subs[c].size && reload(c)), 30000);
+
+  const docSnap = (id, data) => ({ id, exists: data !== undefined, data: () => (data === undefined ? undefined : JSON.parse(JSON.stringify(data))) });
+  const getCmp = (a, k) => k.split('.').reduce((o, p) => (o == null ? undefined : o[p]), a);
+
+  function query(coll, st) {
+    st = st || { where: [], order: null, lim: null };
+    const q = {
+      where: (f, op, v) => query(coll, { ...st, where: [...st.where, [f, op, v]] }),
+      orderBy: (f, dir) => query(coll, { ...st, order: [f, dir || 'asc'] }),
+      limit: n => query(coll, { ...st, lim: n }),
+      _run() {
+        let rows = [...(cache[coll] || new Map()).entries()].map(([id, d]) => [id, d]);
+        st.where.forEach(([f, op, v]) => { rows = rows.filter(([, d]) => {
+          const x = getCmp(d, f);
+          return op === '==' ? x === v : op === '!=' ? x !== v : op === '<' ? x < v : op === '<=' ? x <= v : op === '>' ? x > v : op === '>=' ? x >= v : op === 'in' ? v.includes(x) : op === 'array-contains' ? Array.isArray(x) && x.includes(v) : true; }); });
+        if (st.order) { const [f, dir] = st.order, s = dir === 'desc' ? -1 : 1;
+          rows.sort((a, b) => { const x = getCmp(a[1], f), y = getCmp(b[1], f); return x === y ? 0 : x == null ? 1 : y == null ? -1 : (x < y ? -s : s); }); }
+        if (st.lim) rows = rows.slice(0, st.lim);
+        const docs = rows.map(([id, d]) => docSnap(id, d));
+        return { docs, size: docs.length, empty: !docs.length, forEach: f => docs.forEach(f) };
+      },
+      async get() { await ensure(coll); return q._run(); },
+      onSnapshot(cb, err) {
+        const fn = () => cb(q._run());
+        (subs[coll] = subs[coll] || new Set()).add(fn);
+        ensure(coll).then(fn, e => err && err(e));
+        return () => subs[coll].delete(fn);
+      },
+    };
+    return q;
+  }
+
+  function docRef(coll, id) {
+    const local = (data) => { (cache[coll] = cache[coll] || new Map()); if (data === null) cache[coll].delete(id); else cache[coll].set(id, data); notify(coll); };
+    const fail = e => { reload(coll); throw e; };
+    return {
+      id,
+      async get() { await ensure(coll); return docSnap(id, cache[coll].get(id)); },
+      async set(obj, opts) {
+        const data = clean(obj);
+        if (opts && opts.merge) { local({ ...((cache[coll] || new Map()).get(id) || {}), ...data });
+          const { error } = await sb.rpc('doc_merge', { p_coll: coll, p_id: id, p_patch: data, p_upsert: true }); if (error) fail(error); return; }
+        local(data);
+        const { error } = await sb.from('docs').upsert({ coll, id, data, updated_at: new Date().toISOString() }); if (error) fail(error);
+      },
+      async update(obj) {
+        const data = clean(obj);
+        const cur = (cache[coll] || new Map()).get(id); if (cur) local({ ...cur, ...data });
+        const { data: ok, error } = await sb.rpc('doc_merge', { p_coll: coll, p_id: id, p_patch: data, p_upsert: false });
+        if (error) fail(error); if (!ok) { reload(coll); throw new Error('No document to update: ' + coll + '/' + id); }
+      },
+      async delete() {
+        local(null);
+        const { error } = await sb.from('docs').delete().eq('coll', coll).eq('id', id); if (error) fail(error);
+      },
+      onSnapshot(cb, err) {
+        const fn = () => cb(docSnap(id, (cache[coll] || new Map()).get(id)));
+        (subs[coll] = subs[coll] || new Set()).add(fn);
+        ensure(coll).then(fn, e => err && err(e));
+        return () => subs[coll].delete(fn);
+      },
+    };
+  }
+
+  function collection(path) {
+    const q = query(path);
+    q.doc = id => { id = id || rid(); if (String(id).includes('/')) { const p = String(id).split('/'); const i = p.pop(); return docRef(path + '/' + p.join('/'), i); } return docRef(path, id); };
+    q.add = async obj => { const r = q.doc(); await r.set(obj); return r; };
+    return q;
+  }
+  const db = {
+    collection,
+    doc(path) { const p = path.split('/'); const id = p.pop(); return docRef(p.join('/'), id); },
+  };
+
+  const user = { isOwner: async () => false, id: async () => null };
+  const downloads = {
+    async save({ filename, data }) {
+      const blob = data instanceof Blob ? data : new Blob([data]);
+      const url = URL.createObjectURL(blob), a = document.createElement('a');
+      a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    },
+  };
+
+  window.__fdBackend = { db, user, downloads, sb };
+})();
+
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
@@ -844,7 +975,7 @@ function toast(msg){ const t = $('#toast'); t.textContent = tr(msg); t.hidden = 
 
 /* ---------- shared data ---------- */
 (async () => {
-  const use = n => (window.claude && window.claude.use) ? window.claude.use(n).catch(() => null) : Promise.resolve(null);
+  const use = n => Promise.resolve(window.__fdBackend ? window.__fdBackend[n] : null);
   [db, user, downloads] = await Promise.all([use('db'), use('user'), use('downloads')]);
   if (user) { try { isOwner = await user.isOwner(); uid = await user.id(); } catch(e){} }
   if (!db) { dbMissing = true; render(); return; }
