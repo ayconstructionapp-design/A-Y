@@ -1329,6 +1329,15 @@ function flows(){
   const onway = toCheck();
   return {received, delivered, onway};
 }
+function holdPhoto(id){
+  if (!id) return '';
+  const m = L.materials.find(x => x.id === id); if (!m) return '';
+  if (m.photo) return m.photo;
+  if (m.groupPhoto) return m.groupPhoto;
+  const g = m.group && L.groups.find(x => x.name === m.group && x.brand === m.brand);
+  return (g && g.photo && (g.photo.photo || g.photo)) || '';
+}
+window.__holdInfo = id => { const m = L.materials.find(x => x.id === id); return {src: holdPhoto(id), name: m ? m.name : ''}; };
 const FLOW = {received:['Received', 'Material that arrived and was counted'], delivered:['Delivered', 'Material sent out from the site'], onway:['On the Way', 'Coming to the site, not counted yet']};
 /* home: two big icons — Formwork (deliveries) and Tools */
 VIEWS.home = () => {
@@ -1395,12 +1404,12 @@ VIEWS.flow = () => {
   const k = cur.flow || 'received', list = flows()[k], site = isAdmin || !mySites().length ? null : {name:mySites().map(x => x.name).join(' + ')};
   const tot = {};
   for (const d of list) for (const i of (d.items || [])) { const key = (i.brand || '') + '|' + i.name; const rc = k === 'received' && L.receipts[d.id]; const line = rc && (rc.items || []).find(x => x.key === i.key);
-    tot[key] = tot[key] || {name:i.name, brand:i.brand, qty:0}; tot[key].qty += line ? line.received : (+i.qty || 0); }
+    tot[key] = tot[key] || {name:i.name, brand:i.brand, matId:i.matId || i.key, qty:0}; tot[key].qty += line ? line.received : (+i.qty || 0); }
   const rows = Object.values(tot).sort((a, b) => b.qty - a.qty || a.name.localeCompare(b.name));
   const dir = k === 'delivered' ? 'out' : 'in';
   return `<main class="wrap"><div class="fhead f-${k}"><b>${FLOW[k][0]}</b><span>${list.length} ${list.length === 1 ? 'delivery' : 'deliveries'} · ${rows.reduce((a, r) => a + r.qty, 0)} pcs${site ? ' · ' + esc(site.name) : ' · all sites'}</span></div>
     <p class="lead">${FLOW[k][1]}${k === 'onway' ? '. Open one when the truck arrives to count it.' : '.'}</p>
-    ${rows.length ? `<h3 class="sec">Materials <small>${rows.length}</small></h3><div class="lines tot">${rows.map(r => `<div><span>${esc(brandName(r.brand))} · ${esc(r.name)}</span><span><b>${r.qty}</b> pcs</span></div>`).join('')}</div>` : ''}
+    ${rows.length ? `<h3 class="sec">Materials <small>${rows.length}</small></h3><div class="lines tot">${rows.map(r => `<div${holdPhoto(r.matId) ? ` data-hold="${esc(r.matId)}" class="holdrow"` : ''}><span>${esc(brandName(r.brand))} · ${esc(r.name)}</span><span><b>${r.qty}</b> pcs</span></div>`).join('')}</div>${rows.some(r => holdPhoto(r.matId)) ? '<p class="hint">Press and hold a material to see its photo.</p>' : ''}` : ''}
     <h3 class="sec">Delivery notes <small>${list.length}</small></h3>
     ${list.length ? `<div class="stack">${list.map(d => dlRow(d, dir)).join('')}</div>` : '<div class="empty">Nothing here yet.</div>'}
   </main>`;
@@ -5201,4 +5210,38 @@ render();
 })();
 </script>
 
+<style>
+.holdrow{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;cursor:pointer}
+.holdrow:active{background:var(--accent-soft)}
+#holdprev{position:fixed;inset:0;z-index:90;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;background:rgba(0,0,0,.82);touch-action:none;pointer-events:none}
+#holdprev img{max-width:100%;max-height:78vh;object-fit:contain;background:#fff;border-radius:12px}
+#holdprev p{margin:0;color:#fff;font:600 18px/1.25 var(--body);text-align:center}
+</style>
+<script>
+(function(){
+  let timer = null, shown = false, sx = 0, sy = 0, row = null;
+  const DELAY = 300;
+  function show(id){
+    const info = window.__holdInfo ? window.__holdInfo(id) : null; if (!info || !info.src) return; const src = info.src;
+    const o = document.createElement('div'); o.id = 'holdprev';
+    const im = document.createElement('img'); im.src = src; im.alt = '';
+    const p = document.createElement('p'); p.textContent = info.name;
+    o.append(im, p); document.body.appendChild(o); shown = true;
+    try { navigator.vibrate && navigator.vibrate(15); } catch(_){}
+  }
+  function hide(){ clearTimeout(timer); timer = null; row = null; if (shown) { const o = document.getElementById('holdprev'); if (o) o.remove(); shown = false; } }
+  function start(el, x, y){ hide(); row = el; sx = x; sy = y; const id = el.dataset.hold; timer = setTimeout(() => { show(id); }, DELAY); }
+  const find = t => t && t.closest ? t.closest('[data-hold]') : null;
+  document.addEventListener('touchstart', e => { const el = find(e.target); if (el && e.touches.length === 1) start(el, e.touches[0].clientX, e.touches[0].clientY); }, {passive:true});
+  document.addEventListener('touchmove', e => {
+    if (shown) { e.preventDefault(); return; }
+    if (timer && e.touches[0] && Math.hypot(e.touches[0].clientX - sx, e.touches[0].clientY - sy) > 10) hide();
+  }, {passive:false});
+  ['touchend','touchcancel'].forEach(t => document.addEventListener(t, hide, {passive:true}));
+  document.addEventListener('mousedown', e => { const el = find(e.target); if (el && e.button === 0) start(el, e.clientX, e.clientY); });
+  ['mouseup','mouseleave','blur'].forEach(t => addEventListener(t, hide));
+  document.addEventListener('contextmenu', e => { if (find(e.target)) e.preventDefault(); });
+  document.addEventListener('scroll', () => { if (!shown) hide(); }, true);
+})();
+</script>
 </body></html>
