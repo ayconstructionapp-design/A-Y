@@ -5211,6 +5211,12 @@ render();
 </script>
 
 <style>
+/* app-icon look: photo fills a rounded square, like a phone home-screen icon */
+.mtile .ic{background:#fff!important;border-radius:22%!important;border:0!important}
+.mtile .ic img{inset:0!important;width:100%!important;height:100%!important;padding:4%;box-sizing:border-box;object-fit:contain;border-radius:22%;background:#fff}
+.mtile.on .ic{outline:3px solid var(--accent)!important;outline-offset:-3px}
+</style>
+<style>
 .holdrow{-webkit-touch-callout:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;cursor:pointer}
 .holdrow:active{background:var(--accent-soft)}
 #holdprev{position:fixed;inset:0;z-index:90;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;background:rgba(0,0,0,.82);touch-action:none;pointer-events:none}
