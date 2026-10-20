@@ -184,7 +184,7 @@ textarea.in{min-height:84px;resize:vertical}
 .dir-out{background:var(--danger);color:var(--surface)}
 .dir-in{background:var(--ok);color:var(--surface)}
 .dirlbl{font:600 11px/1 var(--mono);letter-spacing:.05em;text-transform:uppercase}
-.dirlbl.out{color:var(--danger)}.dirlbl.in{color:var(--ok)}
+.dirlbl.lbl-out{color:var(--danger)}.dirlbl.lbl-in{color:var(--ok)}
 .folder{display:flex;align-items:center;gap:12px;width:100%;text-align:left;min-height:64px;padding:10px 14px;border:1px solid var(--line);border-radius:var(--r);background:var(--surface)}
 .folder .fi{width:44px;height:44px;border-radius:10px;background:var(--accent-soft);color:var(--ink);display:grid;place-items:center;flex:none}
 .folder .fi svg{width:26px;height:26px}
@@ -1494,7 +1494,7 @@ VIEWS.all = () => `<main class="wrap"><h2>All deliveries</h2>${L.deliveries.leng
 function dlRow(d, dir){
   const pcs = (d.items || []).reduce((s, i) => s + (+i.qty || 0), 0);
   const icon = dir === 'out' ? `<span class="dir dir-out" aria-label="Sent">${I.out}</span>` : dir === 'in' ? `<span class="dir dir-in" aria-label="Received">${I.inn}</span>` : `<span class="dir">${I.doc}</span>`;
-  const lbl = dir === 'out' ? '<span class="dirlbl out">Sent</span> ' : dir === 'in' ? '<span class="dirlbl in">Received</span> ' : '';
+  const lbl = dir === 'out' ? '<span class="dirlbl lbl-out">Sent</span> ' : dir === 'in' ? '<span class="dirlbl lbl-in">Received</span> ' : '';
   return `<button class="dl" data-a="open-dl" data-id="${esc(d.id)}">${icon}<span class="dlb">
     <span class="dlt"><span class="no">${esc(d.no)}</span><span class="when">${esc(fmtDate(d.createdAt))}</span></span>
     <span class="route">${lbl}${esc(d.from || '—')} → ${esc((d.to && (d.to.name || d.to.address)) || '—')}${d.to && d.to.kind === 'warehouse' ? ' <span class="tag">return</span>' : ''}</span>
