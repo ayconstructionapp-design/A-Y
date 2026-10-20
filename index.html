@@ -1203,6 +1203,7 @@ function gateView(){
 /* ---------- render ---------- */
 function render(){
   const same = lastView === view; const y = window.scrollY;
+  
   let body = '';
   const gate = gateView();
   if (gate) view = gate === 'loading' ? 'login' : gate;
@@ -1215,6 +1216,7 @@ function render(){
   else if (db && !isAdmin && (['stock', 'all', 'lost'].includes(view) || (view === 'stocksite' && !(folder && folder.kind === 'site' && isMySite(folder.id))))) view = 'home';
   else if (['login', 'setup', 'setpw'].includes(view)) view = 'home';
   try { body = gate === 'loading' ? `<main class="wrap"><div class="empty">Loading…</div></main>` : (VIEWS[view] || VIEWS.home)(); } catch(e){ console.error(e); body = `<div class="wrap"><div class="empty">Something went wrong. Go back and try again.</div></div>`; }
+  document.documentElement.dataset.mod = modOf(view);
   app.innerHTML = topbar() + body + sheetHtml() + viewerHtml() + zoomHtml() + sigHtml();
   if (zoomView) bindZoom();
   if (sigPad) bindSig();
@@ -1338,6 +1340,28 @@ function holdPhoto(id){
   return (g && g.photo && (g.photo.photo || g.photo)) || '';
 }
 window.__holdInfo = id => { const m = L.materials.find(x => x.id === id); return {src: holdPhoto(id), name: m ? m.name : ''}; };
+/* ---------- modules: one theme colour each. To add a module: add one entry here (+ its tile on the home screen) ---------- */
+const MODULES = [
+  {id:'f', name:'Formwork',        views:['formwork','flow','deliver','accept','mysites','infrom','inbox','all','person','from','to','truck','brand','system','materials','model','group','review','photos','send','detail','receive','lost','stock','stocksite','mynotes'],
+   light:{c:'#F2B705', on:'#15181B', soft:'#FFF3C4'}, dark:{c:'#FFC629', on:'#111315', soft:'#3A3014'}},
+  {id:'t', name:'Tools',           views:['toolhub','tools','toolsite','tool','tooladd','ho','hosign','mytools','report','transfer','trdetail','kit'],
+   light:{c:'#2E7DD7', on:'#FFFFFF', soft:'#DCEBFA'}, dark:{c:'#5BA0EC', on:'#0B1A2E', soft:'#12263F'}},
+  {id:'o', name:'Order Material',  views:['order','ordersec','ordercart','orders','orderdetail','dnotes','findn'],
+   light:{c:'#E8590C', on:'#FFFFFF', soft:'#FDE3D3'}, dark:{c:'#FF8A4C', on:'#2A1205', soft:'#3A1E0E'}},
+  {id:'s', name:'Sleeping Place',  views:['sleep','slrep','slhome','sloccup'],
+   light:{c:'#12887A', on:'#FFFFFF', soft:'#D4F1EC'}, dark:{c:'#3CC7B3', on:'#06211D', soft:'#0F2E2A'}},
+];
+const modOf = v => (MODULES.find(m => m.views.includes(v)) || {}).id || '';
+(() => {
+  const vars = (k, t) => MODULES.map(m => `--m-${m.id}:${m[k].c};--m-${m.id}-on:${m[k].on};--m-${m.id}-soft:${m[k].soft};`).join('');
+  const css = `:root{${vars('light')}}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){${vars('dark')}}}
+:root[data-theme="dark"]{${vars('dark')}}
+` + MODULES.map(m => `html:root[data-mod="${m.id}"]{--accent:var(--m-${m.id});--on-accent:var(--m-${m.id}-on);--accent-soft:var(--m-${m.id}-soft)}
+.app[data-m="${m.id}"] .app-ic{background:var(--m-${m.id})!important;background-image:none!important;color:var(--m-${m.id}-on)!important}
+.app[data-m="${m.id}"] .app-ic::before{display:none}`).join('\n');
+  const st = document.createElement('style'); st.id = 'modcss'; st.textContent = css; document.head.appendChild(st);
+})();
 const FLOW = {received:['Received', 'Material that arrived and was counted'], delivered:['Delivered', 'Material sent out from the site'], onway:['On the Way', 'Coming to the site, not counted yet']};
 /* home: two big icons — Formwork (deliveries) and Tools */
 VIEWS.home = () => {
@@ -1362,7 +1386,7 @@ VIEWS.home = () => {
     </div>${oDashboard()}</main>`;
 };
 /* iPhone-style app tile: rounded icon, name under it, one short status line, red badge */
-const appTile = (v, cls, icon, name, sub, badge) => `<button class="app ${cls}" data-a="go" data-v="${v}"><span class="app-ic">${icon}${badge ? `<span class="app-b">${badge > 99 ? '99+' : badge}</span>` : ''}</span><b class="app-n">${name}</b><small class="app-s">${sub}</small></button>`;
+const appTile = (v, cls, icon, name, sub, badge) => `<button class="app ${cls}" data-m="${cls.slice(3)}" data-a="go" data-v="${v}"><span class="app-ic">${icon}${badge ? `<span class="app-b">${badge > 99 ? '99+' : badge}</span>` : ''}</span><b class="app-n">${name}</b><small class="app-s">${sub}</small></button>`;
 VIEWS.toolhub = () => {
   const sites = isAdmin ? [] : mySites(), site = sites.length ? sites.map(x => x.name).join(' + ') : '';
   const c = toolCounts(L.tools.filter(t => isAdmin || (t.siteId && isMySite(t.siteId))));
