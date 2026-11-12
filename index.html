@@ -724,9 +724,11 @@ body *{text-transform:none!important}
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
-/* Supabase adapter (server v2): gives the app the db / user / downloads objects it used inside Claude.
-   Nothing is read or written directly: every call goes through a server function that checks who is signed in
-   and what that account is allowed to do. */
+/* Supabase adapter (server v3): gives the app the db / user / downloads objects it used inside Claude.
+   - Every call goes through a server function that checks who is signed in and what that account may do.
+   - Photos come as short references ("fdimg:<code>"); each photo is downloaded once and kept on the phone.
+   - The last data is kept on the phone, so the app opens and works without internet. Changes made offline
+     wait on the phone and are sent, in order, when the internet is back. */
 (function () {
   const SUPABASE_URL = 'https://ptvhnipvcmczzwgsnmqz.supabase.co';
   const SUPABASE_KEY = 'sb_publishable_liqrVWX75gD7sjtw4sgKGA_D3TcWcbM';
@@ -736,46 +738,136 @@ body *{text-transform:none!important}
   let token = ls.get('fd-token') || null;
   if (!token) ls.del('fd-me');                        // no server session: nobody is signed in on this phone
 
+  /* ---------- phone storage (IndexedDB): photos, last data, changes waiting to be sent ---------- */
+  let idbP = null;
+  function idb() {
+    if (!idbP) idbP = new Promise((res, rej) => {
+      try {
+        const r = indexedDB.open('fd-cache', 1);
+        r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('img'); d.createObjectStore('coll'); d.createObjectStore('q', { keyPath: 'n', autoIncrement: true }); };
+        r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+      } catch (e) { rej(e); }
+    }).catch(() => null);
+    return idbP;
+  }
+  async function st(store, mode, fn) {
+    const d = await idb(); if (!d) return undefined;
+    return new Promise((res) => {
+      try { const t = d.transaction(store, mode), s = t.objectStore(store); const out = fn(s); t.oncomplete = () => res(out && 'result' in out ? out.result : out); t.onerror = () => res(undefined); t.onabort = () => res(undefined); }
+      catch (_) { res(undefined); }
+    });
+  }
+  const idbGet = (store, k) => st(store, 'readonly', s => s.get(k));
+  const idbPut = (store, k, v) => st(store, 'readwrite', s => (k === undefined ? s.put(v) : s.put(v, k)));
+  const idbDel = (store, k) => st(store, 'readwrite', s => s.delete(k));
+  const idbAll = store => st(store, 'readonly', s => s.getAll());
+  const idbClear = store => st(store, 'readwrite', s => s.clear());
+
+  /* ---------- online / offline ---------- */
+  const status = { offline: false, pending: 0, dropped: 0, since: 0 };
+  const statusSubs = new Set();
+  function setOffline(v) { if (status.offline !== v) { status.offline = v; status.since = Date.now(); statusSubs.forEach(f => { try { f(status); } catch (_) {} }); if (!v) flushSoon(); } }
+  function setPending(n) { if (status.pending !== n) { status.pending = n; statusSubs.forEach(f => { try { f(status); } catch (_) {} }); } }
+  const isNetErr = e => !!e && e.code === 'unavailable';
+
   const clean = o => JSON.parse(JSON.stringify(o === undefined ? {} : o));
   const rid = () => (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '').slice(0, 20) : Math.random().toString(36).slice(2) + Date.now().toString(36));
-  const cache = {};      // coll -> Map(id -> data)
-  const loaded = {};     // coll -> Promise
-  const subs = {};       // coll -> Set(fn)
-  const timers = {};
-  const seenTick = {};   // coll -> last change counter seen
-  let stock = null; const stockSubs = new Set();
 
   let dropping = false;
   function dropSession() {                             // the server no longer knows this session: sign out here too
     if (dropping) return; dropping = true;
     token = null; ls.del('fd-token'); ls.del('fd-me');
+    idbClear('coll');
     setTimeout(() => location.reload(), 50);
   }
   async function rpc(fn, args) {
-    const { data, error } = await sb.rpc(fn, args || {});
+    let data, error;
+    try {
+      const call = sb.rpc(fn, args || {});
+      const r = await Promise.race([call, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 20000))]);
+      data = r.data; error = r.error;
+    } catch (x) { error = { message: String((x && x.message) || x) }; }
     if (error) {
-      const e = new Error(error.message || 'error');
-      e.code = /fd_auth/.test(error.message || '') ? 'auth' : /fd_denied/.test(error.message || '') ? 'denied' : 'unavailable';
+      const m = error.message || 'error';
+      const e = new Error(m);
+      e.code = /fd_auth/.test(m) ? 'auth' : /fd_denied/.test(m) ? 'denied' : (/permission denied|violates|invalid input|does not exist|syntax/i.test(m) ? 'server' : 'unavailable');
+      if (e.code === 'unavailable') setOffline(true); else setOffline(false);
       if (e.code === 'auth' && token) dropSession();
       throw e;
     }
+    setOffline(false);
     return data;
   }
 
-  async function fetchAll(coll) {
-    const m = new Map();
-    if (coll === 'accounts') { const a = await rpc('fd_accounts'); Object.entries(a || {}).forEach(([id, d]) => m.set(id, d)); return m; }
-    if (!token) {
-      if (coll === 'catalog/main/people') (await rpc('fd_names') || []).forEach(p => m.set(p.id, { name: p.name || '', surname: p.surname || '', role: p.role || 'manager' }));
-      return m;                                        // before sign-in only the names for the sign-in screen exist
+  /* ---------- photos ---------- */
+  const imgMem = new Map();                             // code -> data: URL
+  const refsIn = (v, out) => { if (typeof v === 'string') { if (v.startsWith('fdimg:')) out.add(v.slice(6)); } else if (v && typeof v === 'object') { for (const k in v) refsIn(v[k], out); } return out; };
+  const swap = v => typeof v === 'string' ? (v.startsWith('fdimg:') ? (imgMem.get(v.slice(6)) || '') : v)
+    : Array.isArray(v) ? v.map(swap) : (v && typeof v === 'object') ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, swap(x)])) : v;
+  async function loadImgs(codes) {
+    const need = [...codes].filter(c => !imgMem.has(c)); if (!need.length) return;
+    const fromPhone = await Promise.all(need.map(c => idbGet('img', c)));
+    const missing = [];
+    need.forEach((c, i) => { if (typeof fromPhone[i] === 'string') imgMem.set(c, fromPhone[i]); else missing.push(c); });
+    if (!missing.length || !token) return;
+    for (let i = 0; i < missing.length; i += 40) {
+      let got; try { got = await rpc('fd_imgs', { t: token, p_ids: missing.slice(i, i + 40) }); } catch (_) { return; }
+      for (const [c, d] of Object.entries(got || {})) { imgMem.set(c, d); idbPut('img', c, d); }
     }
-    const t = token;
-    for (let from = 0; ; from += 100) {
-      const rows = await rpc('fd_list', { t, p_coll: coll, p_from: from, p_n: 100 }) || [];
-      rows.forEach(r => m.set(r.id, r.data));
-      if (rows.length < 100) break;
+  }
+
+  /* ---------- data ---------- */
+  const cache = {};      // coll -> Map(id -> data, photos filled in)
+  const loaded = {};     // coll -> Promise
+  const subs = {};       // coll -> Set(fn)
+  const timers = {};
+  const seenTick = {};   // coll -> last change counter seen
+  let stock = null; const stockSubs = new Set();
+  let queue = [];        // changes waiting to be sent: {n, fn, args, coll, id, op, data}
+  const queueReady = idbAll('q').then(a => { queue = (a || []).sort((x, y) => x.n - y.n); setPending(queue.length); });
+
+  const who = () => ls.get('fd-me') || '';
+  function overlayQueue(coll, m) {                      // changes made on this phone that the server has not got yet
+    for (const q of queue) if (q.coll === coll) {
+      if (q.op === 'set') m.set(q.id, clean(q.data));
+      else if (q.op === 'merge') m.set(q.id, { ...(m.get(q.id) || {}), ...clean(q.data) });
+      else if (q.op === 'del') m.delete(q.id);
     }
     return m;
+  }
+  async function fromRows(rows) {
+    await loadImgs(refsIn(rows, new Set()));
+    const m = new Map(); rows.forEach(r => m.set(r.id, swap(r.data))); return m;
+  }
+  async function fetchAll(coll) {
+    await queueReady;
+    if (coll === 'accounts') {
+      try { const a = await rpc('fd_accounts'); idbPut('coll', 'accounts', { who: '*', rows: a || {} }); return new Map(Object.entries(a || {})); }
+      catch (e) { if (!isNetErr(e)) throw e; const c = await idbGet('coll', 'accounts'); return new Map(Object.entries((c && c.rows) || {})); }
+    }
+    if (!token) {
+      const m = new Map();
+      if (coll === 'catalog/main/people') {
+        let names; try { names = await rpc('fd_names') || []; idbPut('coll', '__names', { who: '*', rows: names }); }
+        catch (e) { if (!isNetErr(e)) throw e; const c = await idbGet('coll', '__names'); names = (c && c.rows) || []; }
+        names.forEach(p => m.set(p.id, { name: p.name || '', surname: p.surname || '', role: p.role || 'manager' }));
+      }
+      return m;                                         // before sign-in only the names for the sign-in screen exist
+    }
+    const t = token, rows = [];
+    try {
+      for (let from = 0; ; from += 100) {
+        const page = await rpc('fd_list', { t, p_coll: coll, p_from: from, p_n: 100 }) || [];
+        rows.push(...page);
+        if (page.length < 100) break;
+      }
+      idbPut('coll', coll, { who: who(), at: Date.now(), rows });
+    } catch (e) {
+      if (!isNetErr(e)) throw e;
+      const c = await idbGet('coll', coll);              // no internet: the last data kept on this phone
+      if (c && c.who === who()) rows.push(...c.rows);
+    }
+    return overlayQueue(coll, await fromRows(rows));
   }
   function notify(coll) { (subs[coll] || new Set()).forEach(f => { try { f(); } catch (e) { console.error(e); } }); }
   function reload(coll, now) {
@@ -790,9 +882,40 @@ body *{text-transform:none!important}
   }
   async function loadStock() {
     if (!token) { stock = null; return; }
-    try { stock = await rpc('fd_stock', { t: token }); stockSubs.forEach(f => { try { f(stock); } catch (e) { console.error(e); } }); } catch (e) { console.error(e); }
+    try { stock = await rpc('fd_stock', { t: token }); idbPut('coll', '__stock', { who: who(), rows: stock }); }
+    catch (e) { if (!isNetErr(e)) { console.error(e); return; } const c = await idbGet('coll', '__stock'); if (!c || c.who !== who()) return; stock = c.rows; }
+    stockSubs.forEach(f => { try { f(stock); } catch (e) { console.error(e); } });
   }
   function reloadAll() { Object.keys(cache).concat(Object.keys(subs)).filter((c, i, a) => a.indexOf(c) === i).forEach(c => reload(c, true)); loadStock(); }
+
+  /* ---------- changes made without internet ---------- */
+  async function enqueue(fn, args, coll, id, op, data) {
+    const item = { fn, args, coll, id, op, data, at: Date.now() };
+    const n = await idbPut('q', undefined, item);
+    item.n = typeof n === 'number' ? n : Date.now();
+    queue.push(item); setPending(queue.length);
+  }
+  let flushing = false, flushT = null;
+  function flushSoon() { clearTimeout(flushT); flushT = setTimeout(flush, 800); }
+  async function flush() {
+    await queueReady;
+    if (flushing || !queue.length || !token) return;
+    flushing = true; let sent = 0;
+    try {
+      while (queue.length) {
+        const q = queue[0];
+        try { await rpc(q.fn, { ...q.args, t: token }); }
+        catch (e) {
+          if (isNetErr(e) || e.code === 'auth') break;  // still offline, or signed out: try again later
+          status.dropped++; console.warn('A change made offline was refused by the server', q, e);
+        }
+        queue.shift(); idbDel('q', q.n); sent++; setPending(queue.length);
+      }
+    } finally { flushing = false; }
+    if (sent) reloadAll();
+  }
+  window.addEventListener('online', flushSoon);
+  setInterval(flush, 20000);
 
   /* live updates: phones watch only the change counters (no data in them); what changed is fetched again */
   function onTick(coll, n) {
@@ -802,19 +925,27 @@ body *{text-transform:none!important}
     if (cache[coll] || (subs[coll] && subs[coll].size)) reload(coll);
   }
   async function pollTicks() {
-    try { const { data } = await sb.from('fd_ticks').select('coll,n'); (data || []).forEach(r => onTick(r.coll, r.n)); } catch (_) {}
+    try {
+      const { data, error } = await sb.from('fd_ticks').select('coll,n');
+      if (error) throw error;
+      const wasOff = status.offline; setOffline(false);
+      (data || []).forEach(r => onTick(r.coll, r.n));
+      if (wasOff) reloadAll();
+    } catch (_) { setOffline(true); }
   }
   try {
     sb.channel('fd-ticks').on('postgres_changes', { event: '*', schema: 'public', table: 'fd_ticks' }, p => { const r = p.new || {}; if (r.coll) onTick(r.coll, r.n); }).subscribe();
   } catch (_) {}
   pollTicks(); setInterval(pollTicks, 20000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollTicks(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollTicks(); flushSoon(); } });
+  window.addEventListener('online', () => setTimeout(pollTicks, 500));
+  window.addEventListener('offline', () => setOffline(true));
 
   const docSnap = (id, data) => ({ id, exists: data !== undefined, data: () => (data === undefined ? undefined : JSON.parse(JSON.stringify(data))) });
   const getCmp = (a, k) => k.split('.').reduce((o, p) => (o == null ? undefined : o[p]), a);
 
-  function query(coll, st) {
-    st = st || { where: [], order: null, lim: null };
+  function query(coll, st0) {
+    const st = st0 || { where: [], order: null, lim: null };
     const q = {
       where: (f, op, v) => query(coll, { ...st, where: [...st.where, [f, op, v]] }),
       orderBy: (f, dir) => query(coll, { ...st, order: [f, dir || 'asc'] }),
@@ -831,7 +962,7 @@ body *{text-transform:none!important}
         return { docs, size: docs.length, empty: !docs.length, forEach: f => docs.forEach(f) };
       },
       async get() { await ensure(coll); return q._run(); },
-      onSnapshot(cb, err) {
+      onSnapshot(cb) {
         const fn = () => cb(q._run());
         (subs[coll] = subs[coll] || new Set()).add(fn);
         ensure(coll).then(fn, () => { fn(); setTimeout(() => reload(coll), 4000); });
@@ -844,33 +975,39 @@ body *{text-transform:none!important}
   function docRef(coll, id) {
     const local = (data) => { (cache[coll] = cache[coll] || new Map()); if (data === null) cache[coll].delete(id); else cache[coll].set(id, data); notify(coll); };
     const fail = e => { reload(coll); throw e; };
+    /* send a change; without internet keep it on the phone and report success */
+    async function send(fn, args, op, data) {
+      if (queue.length || status.offline) { await enqueue(fn, args, coll, id, op, data); flushSoon(); return true; }
+      try { return await rpc(fn, args); }
+      catch (e) { if (isNetErr(e)) { await enqueue(fn, args, coll, id, op, data); return true; } fail(e); }
+    }
     return {
       id,
       async get() { await ensure(coll); return docSnap(id, cache[coll].get(id)); },
       async set(obj, opts) {
         const data = clean(obj);
-        if (coll === 'accounts') {                     // passwords live in a private table on the server
+        if (coll === 'accounts') {                     // passwords live in a private table on the server (needs internet)
           const r = await rpc('fd_set_password', { t: token, p_id: id, p_salt: data.salt, p_hash: data.hash, p_must: !!data.mustChange });
           if (r && r.token) { token = r.token; ls.set('fd-token', token); setTimeout(reloadAll, 0); }
           local({ salt: data.salt, mustChange: !!data.mustChange }); return;
         }
         if (opts && opts.merge) { local({ ...((cache[coll] || new Map()).get(id) || {}), ...data });
-          try { await rpc('fd_merge', { t: token, p_coll: coll, p_id: id, p_patch: data, p_upsert: true }); } catch (e) { fail(e); } return; }
+          await send('fd_merge', { t: token, p_coll: coll, p_id: id, p_patch: data, p_upsert: true }, 'merge', data); return; }
         local(data);
-        try { await rpc('fd_set', { t: token, p_coll: coll, p_id: id, p_data: data }); } catch (e) { fail(e); }
+        await send('fd_set', { t: token, p_coll: coll, p_id: id, p_data: data }, 'set', data);
       },
       async update(obj) {
         const data = clean(obj);
         const cur = (cache[coll] || new Map()).get(id); if (cur) local({ ...cur, ...data });
-        let ok; try { ok = await rpc('fd_merge', { t: token, p_coll: coll, p_id: id, p_patch: data, p_upsert: false }); } catch (e) { fail(e); }
+        const ok = await send('fd_merge', { t: token, p_coll: coll, p_id: id, p_patch: data, p_upsert: false }, 'merge', data);
         if (!ok) { reload(coll); throw new Error('No document to update: ' + coll + '/' + id); }
       },
       async delete() {
         if (coll === 'accounts') { try { await rpc('fd_del_account', { t: token, p_id: id }); } catch (_) {} local(null); return; }
         local(null);
-        try { await rpc('fd_del', { t: token, p_coll: coll, p_id: id }); } catch (e) { fail(e); }
+        await send('fd_del', { t: token, p_coll: coll, p_id: id }, 'del', null);
       },
-      onSnapshot(cb, err) {
+      onSnapshot(cb) {
         const fn = () => cb(docSnap(id, (cache[coll] || new Map()).get(id)));
         (subs[coll] = subs[coll] || new Set()).add(fn);
         ensure(coll).then(fn, () => { fn(); setTimeout(() => reload(coll), 4000); });
@@ -888,22 +1025,28 @@ body *{text-transform:none!important}
   const db = {
     collection,
     doc(path) { const p = path.split('/'); const id = p.pop(); return docRef(p.join('/'), id); },
-    /* next delivery-note or order number, handed out one at a time by the server */
+    /* next delivery-note or order number, handed out one at a time by the server (needs internet) */
     async serial(min, path) { return Number(await rpc('fd_next', { t: token, p_path: path || 'counters/notes', p_min: min || 0 })); },
     /* stock per site from the server's ledger */
     onStock(cb) { stockSubs.add(cb); if (stock) cb(stock); else loadStock(); return () => stockSubs.delete(cb); },
     moves(site, n) { return rpc('fd_moves_list', { t: token, p_site: site || null, p_n: n || 500 }); },
+    /* the nightly copies kept on the server (admin) */
+    backups() { return rpc('fd_backup_list', { t: token }); },
+    /* internet and waiting changes, for the app's banner */
+    status() { return { ...status }; },
+    onStatus(cb) { statusSubs.add(cb); return () => statusSubs.delete(cb); },
+    flush,
   };
 
-  /* sign-in checked by the server */
+  /* sign-in checked by the server (needs internet the first time; afterwards the phone stays signed in) */
   const auth = {
     server: true,
     async login(personId, hash) {
       const r = await rpc('fd_login', { p_id: personId, p_hash: hash });
       if (!r || !r.ok) return r && r.locked ? 'locked' : false;
-      token = r.token; ls.set('fd-token', token);
+      token = r.token; ls.set('fd-token', token); ls.set('fd-me', personId);
       await Promise.all(['catalog/main/people', 'accounts'].map(c => fetchAll(c).then(m => { cache[c] = m; loaded[c] = Promise.resolve(); notify(c); }).catch(() => {})));
-      setTimeout(reloadAll, 0);
+      setTimeout(() => { reloadAll(); flushSoon(); }, 0);
       return true;
     },
     /* check a password without changing the session (used before a password change) */
@@ -911,6 +1054,7 @@ body *{text-transform:none!important}
     logout() {
       const t = token; token = null; ls.del('fd-token'); stock = null;
       if (t) rpc('fd_logout', { t }).catch(() => {});
+      idbClear('coll'); idbClear('q'); queue = []; setPending(0);
       Object.keys(cache).forEach(c => { if (c !== 'accounts') cache[c] = new Map(); });
       reloadAll();
     },
@@ -1002,6 +1146,7 @@ const L = {people:[], sites:[], warehouses:[], companies:[], materials:[], group
 let recv = {marks:{}, photos:[]};          // receiving check in progress
 let me = null;                // logged-in person (in-app account)
 const loaded = {people:false, accounts:false};
+let srvBackups = null;
 let slowLoad = false, sampler = null, noteBusy = false;
 const AUTH = (window.__fdBackend && window.__fdBackend.auth) || null;   /* set when a server checks the sign-in (Supabase version) */
 let LEDGER = null, ledgerDiff = null;                                   /* stock per site from the server's ledger, when there is one */
@@ -1081,6 +1226,11 @@ Object.assign(TR.sq, {"Access (tick what this account may open · admins always 
 Object.assign(TR.hr, {"Access (tick what this account may open · admins always have everything)": "Pristup (označite što ovaj račun smije otvoriti · administratori uvijek imaju sve)", "Too many wrong tries. Wait 5 minutes and try again.": "Previše pogrešnih pokušaja. Pričekajte 5 minuta i pokušajte ponovno.", "Stock ledger": "Knjiga zaliha", "Checking…": "Provjera…", "The stock on every site is the sum of the ledger rows on the server. Checked against the delivery notes: everything matches ✓": "Zaliha na svakom gradilištu zbroj je redaka knjige na poslužitelju. Provjereno s otpremnicama: sve se slaže ✓"});
 Object.assign(TR.sq, {"No part of the app is open for your account yet. Ask an admin to tick what you need in Admin → Accounts.": "Asnjë pjesë e aplikacionit nuk është hapur ende për llogarinë tënde. Kërkoji adminit të shënojë çfarë të duhet te Admin → Llogaritë."});
 Object.assign(TR.hr, {"No part of the app is open for your account yet. Ask an admin to tick what you need in Admin → Accounts.": "Za vaš račun još nije otvoren nijedan dio aplikacije. Zamolite administratora da označi što trebate u Admin → Računi."});
+Object.assign(TR.sq, {"No internet.": "Pa internet.", "You see the data saved on this phone.": "Po sheh të dhënat e ruajtura në këtë telefon.", "Changes you make are kept and sent later.": "Ndryshimet që bën ruhen dhe dërgohen më vonë.", "It goes by itself when the internet is back.": "Dërgohet vetë kur të kthehet interneti.", "Automatic backups: checking…": "Kopjet automatike: duke kontrolluar…", "Automatic backups: none yet. The first one is made tonight.": "Kopjet automatike: ende asnjë. E para bëhet sonte.", "Download one now and then and keep it outside the server.": "Shkarko herë pas here një dhe mbaje jashtë serverit."});
+Object.assign(TR.hr, {"No internet.": "Nema interneta.", "You see the data saved on this phone.": "Vidite podatke spremljene na ovom telefonu.", "Changes you make are kept and sent later.": "Promjene se spremaju i šalju kasnije.", "It goes by itself when the internet is back.": "Šalje se samo kad se internet vrati.", "Automatic backups: checking…": "Automatske sigurnosne kopije: provjera…", "Automatic backups: none yet. The first one is made tonight.": "Automatske sigurnosne kopije: još nijedna. Prva se radi večeras.", "Download one now and then and keep it outside the server.": "Povremeno preuzmite jednu i čuvajte je izvan poslužitelja."});
+TRP.push([/^(\d+) (?:change waits|changes wait)$/, "$1 ndryshime presin", "Promjena na čekanju: $1"]);
+TRP.push([/^(\d+) (?:change has|changes have) not been sent yet\. Log out when the internet is back and they are sent\.$/, "$1 ndryshime nuk janë dërguar ende. Dil kur të kthehet interneti dhe të dërgohen.", "Promjene još nisu poslane ($1). Odjavite se kad se internet vrati i promjene pošalju."]);
+TRP.push([/^Automatic backup every night\. (\d+) kept on the server, the newest from (.+)\.$/, "Kopje automatike çdo natë. $1 ruhen në server, më e reja nga $2.", "Automatska kopija svake noći. Na poslužitelju ih je $1, najnovija od $2."]);
 TRP.push([/^Since (.+) · (\d+) days$/, "Që nga $1 · $2 ditë", "Od $1 · $2 dana"]);
 TRP.push([/^Delivery sent: (.+)$/, "Dërgesa u nis: $1", "Isporuka poslana: $1"]);
 TRP.push([/^Returned: (No\. .+)$/, "U kthye: $1", "Vraćeno: $1"]);
@@ -1156,6 +1306,7 @@ function toast(msg){ const t = $('#toast'); t.textContent = tr(msg); t.hidden = 
   liveWin('receipts', 'receipts');
   setTimeout(() => { if (!dbReady) { slowLoad = true; render(); } }, 10000);
   setTimeout(outboxFlush, 5000);
+  if (db.onStatus) db.onStatus(() => refresh());
   if (db.onStock) db.onStock(st => { LEDGER = st; refresh(); setTimeout(() => { const was = ledgerDiff; ledgerCheck(); if (was !== ledgerDiff) refresh(); }, 4000); });
   db.collection('accounts').limit(500).onSnapshot(s => { L.accounts = {}; s.docs.forEach(x => L.accounts[x.id] = x.data()); loaded.accounts = true; restoreSession(); refresh(); }, () => {});
   db.doc('catalog/main').onSnapshot(s => { L.settings = s.exists ? s.data() : {}; refresh(); }, () => {});
@@ -1290,7 +1441,7 @@ function viewerHtml(){
 const LOST = '__lost';
 let stockMemo = null, availMemo = null;
 /* With a server ledger, stock is the sum of its rows. Without one (inside Claude) the app works it out itself. */
-function siteStock(){ return LEDGER || siteStockCalc(); }
+function siteStock(){ const st = db && db.status ? db.status() : null; return LEDGER && !(st && (st.offline || st.pending)) ? LEDGER : siteStockCalc(); }   /* offline: work it out on the phone, so changes made here show at once */
 function ledgerCheck(){
   if (!LEDGER || !isAdmin) { ledgerDiff = null; return; }
   const flat = st => { const o = {}; for (const [k, v] of Object.entries(st || {})) for (const [m, q] of Object.entries(v || {})) if (q) o[k + '|' + m] = q; return o; };
@@ -1395,6 +1546,13 @@ function gateView(){
 }
 
 /* ---------- render ---------- */
+/* Supabase version: no internet / changes waiting to be sent */
+function netBar(){
+  if (!db || !db.status || !me) return '';
+  const st = db.status();
+  if (!st.offline && !st.pending) return '';
+  return `<div class="banner" style="margin:8px 16px 0;border-radius:10px">${st.offline ? '<b>No internet.</b> You see the data saved on this phone. ' : ''}${st.pending ? `<b>${st.pending} ${st.pending === 1 ? 'change waits' : 'changes wait'}</b> to be sent. It goes by itself when the internet is back.` : 'Changes you make are kept and sent later.'}</div>`;
+}
 let osDraft = {};
 function grabOs(){ app.querySelectorAll('input.os').forEach(i => { osDraft[i.dataset.mat] = i.value; }); }
 function render(){
@@ -1417,7 +1575,7 @@ function render(){
   else if (['login', 'setup', 'setpw'].includes(view)) view = 'home';
   try { body = gate === 'loading' ? `<main class="wrap"><div class="empty">${slowLoad ? 'The data cannot be reached yet. Check your internet connection. The app keeps trying.' : 'Loading…'}</div></main>` : (VIEWS[view] || VIEWS.home)(); } catch(e){ console.error(e); body = `<div class="wrap"><div class="empty">Something went wrong. Go back and try again.</div></div>`; }
   document.documentElement.dataset.mod = modOf(view);
-  app.innerHTML = topbar() + body + sheetHtml() + viewerHtml() + zoomHtml() + sigHtml();
+  app.innerHTML = topbar() + netBar() + body + sheetHtml() + viewerHtml() + zoomHtml() + sigHtml();
   { const hd = app.querySelector('.bar'); if (hd) document.documentElement.style.setProperty('--barh', hd.offsetHeight + 'px'); }   /* sticky filters sit just under the header */
   if (zoomView) bindZoom();
   if (sigPad) bindSig();
@@ -1784,7 +1942,7 @@ function notifications(){
     pendingList().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).forEach(d => out.push({kind:'wait', id:d.id, a:'open-dl', title:`Approve or cancel delivery ${d.no}`,
       text:`${route(d)} · sent by ${d.person || '—'} · ${(d.items || []).length} items, ${pcsOf(d)} pcs`, at:d.createdAt}));
     const open = lostEntries().filter(e => !e.res);
-    if (Date.now() - (L.settings.lastBackup || 0) > 7 * 864e5 && L.deliveries.length) out.push({kind:'wait', a:'go-backup', nodate:true, title:'Time for a backup', text:L.settings.lastBackup ? 'The last backup is more than a week old. Tap to download a new one.' : 'No backup has been made yet. Tap to download one.'});
+    if (Date.now() - (L.settings.lastBackup || 0) > (db.backups ? 30 : 7) * 864e5 && L.deliveries.length) out.push({kind:'wait', a:'go-backup', nodate:true, title:'Time for a backup', text:L.settings.lastBackup ? 'The last backup is more than a week old. Tap to download a new one.' : 'No backup has been made yet. Tap to download one.'});
     if (open.length) out.push({kind:'lost', a:'go', v:'lost', title:'Lost material to resolve',
       text:`${open.length} ${open.length === 1 ? 'difference' : 'differences'}, ${open.reduce((a, e) => a + e.diff, 0)} pcs. Decide where the missing pieces are, or write them off.`});
   }
@@ -2888,7 +3046,8 @@ VIEWS.admin = () => {
       <button class="btn">Save</button></form>
       ${LEDGER ? `<h3>Stock ledger</h3><p class="hint" style="margin-top:0">${ledgerDiff === null ? 'Checking…' : ledgerDiff === 0 ? 'The stock on every site is the sum of the ledger rows on the server. Checked against the delivery notes: everything matches ✓' : `The ledger and the delivery notes differ in ${ledgerDiff} places. Wait a minute and open this page again; if it stays, tell support.`}</p>` : ''}
       <h3>Backup</h3><p class="hint" style="margin-top:0">Saves a copy of all data (deliveries, stock, tools, orders, accounts, sleeping places) as one file. Do it every week and keep the file in a safe place.</p>
-      <p class="hint">${s.lastBackup ? 'Last backup: ' + esc(fmtDate(s.lastBackup)) : 'No backup made yet.'}</p>
+      ${db.backups ? `<p class="hint">${srvBackups === null ? 'Automatic backups: checking…' : srvBackups.length ? `Automatic backup every night. ${srvBackups.length} kept on the server, the newest from ${esc(fmtDate(srvBackups[0].at))}.` : 'Automatic backups: none yet. The first one is made tonight.'}</p>` : ''}
+      <p class="hint">${s.lastBackup ? 'Last backup: ' + esc(fmtDate(s.lastBackup)) : 'No backup made yet.'}${db.backups ? ' Download one now and then and keep it outside the server.' : ''}</p>
       <button class="btn dark" data-a="backup">Download backup</button>`;
   }
   return h + `</main>`;
@@ -4938,7 +5097,8 @@ document.addEventListener('click', async e => {
     case 'zoom-close': zoomView = null; render(); break;
     case 'rm-rphoto': recv.photos.splice(+el.dataset.i, 1); render(); break;
     case 'resolve': if (isAdmin) await resolveLost(el); break;
-    case 'logout': setMe(null); D = null; saveDraft(); go('home'); break;
+    case 'logout': if (db && db.status && db.status().pending) { const n = db.status().pending; toast(`${n} ${n === 1 ? 'change has' : 'changes have'} not been sent yet. Log out when the internet is back and they are sent.`); db.flush && db.flush(); break; }
+      setMe(null); D = null; saveDraft(); go('home'); break;
     case 'owner-in': setMe({id:'owner', name:'App owner', surname:'', role:'admin'}); adminTab = 'people'; lastAdmin = false; go('admin'); break;
     case 'edit': editId = id; render(); break;
     case 'edit-cancel': editId = null; render(); break;
@@ -5045,7 +5205,7 @@ document.addEventListener('click', async e => {
     case 'copy': { const inp = document.getElementById(el.dataset.src); try { await navigator.clipboard.writeText(inp.value); toast('Copied'); } catch(_) { inp.select(); } break; }
     case 'finish': D = null; pdf = null; saveDraft(); cur.brand = cur.system = null; go('formwork'); break;
     case 'open-dl': detail = L.deliveries.find(d => d.id === id); detailFrom = view; markSeen(detail); adminSeen(detail); lastAdmin = view === 'admin'; pdf = null; go('detail'); break;
-    case 'atab': adminTab = id; armed = null; editId = null; tabReveal = true; render(); break;
+    case 'atab': if (id === 'settings' && db && db.backups) db.backups().then(b => { srvBackups = b || []; render(); }, () => {}); adminTab = id; armed = null; editId = null; tabReveal = true; render(); break;
     case 'tabscroll': { const t = $('#admintabs'); if (t) t.scrollBy({left:(+el.dataset.d) * t.clientWidth * 0.7, behavior:'smooth'}); break; }
     case 'abrand': aBrand = id; render(); break;
     case 'asys': aSys = id; render(); break;
