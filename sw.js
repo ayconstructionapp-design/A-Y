@@ -1,9 +1,9 @@
-// Formwork Delivery: keeps the app on the phone so it opens without internet.
+// A&Y app: keeps the app on the phone so it opens without internet.
 // The page itself: newest from the internet when there is a connection, else the copy on the phone.
 // Order catalogue photos, icons and the PDF / Excel / Supabase libraries: kept on the phone after the first download.
 // Data never goes through here (it is kept by the app itself).
-const CACHE = 'fd-app-v3';
-const CORE = ['./', './index.html', './manifest.json', './ordercat.json', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
+const CACHE = 'fd-app-v5';
+const CORE = ['./', './index.html', './manifest.json', './ordercat.json', './icon-192.png', './icon-512.png', './apple-touch-icon.png', 'https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => Promise.all(CORE.map(u => c.add(new Request(u, { cache: 'reload' })).catch(() => {})))).then(() => self.skipWaiting()));
@@ -44,4 +44,21 @@ self.addEventListener('fetch', e => {
     return;
   }
   if (/cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|unpkg\.com|fonts\.(googleapis|gstatic)\.com/.test(u.hostname)) e.respondWith(kept(req));   // versioned libraries and fonts
+});
+
+// phone notifications
+self.addEventListener('push', e => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'A&Y', {
+    body: d.body || '', icon: 'icon-192.png', badge: 'icon-192.png', tag: d.tag || undefined, renotify: !!d.tag, data: { url: d.url || './' },
+  }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const url = new URL((e.notification.data && e.notification.data.url) || './', self.registration.scope).href;
+  e.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+    for (const c of cs) if (c.url.startsWith(self.registration.scope) && 'focus' in c) return c.focus();
+    return self.clients.openWindow(url);
+  }));
 });
